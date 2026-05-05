@@ -1,10 +1,10 @@
 const express = require("express");
 const WebSocket = require("ws");
 const http = require("http");
-const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
+const { createClient } = require("@deepgram/sdk");
 const OpenAI = require("openai");
-const twilio = require("twilio");
 const fetch = require("node-fetch");
+const twilio = require("twilio");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -16,17 +16,9 @@ const wss = new WebSocket.Server({ server });
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "pqHfZKP75CvOlQylNhV4";
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
-const SYSTEM_PROMPT = `Te egy magyar nyelvű AI asszisztens vagy egy fodrászat számára.
-A fodrászat neve: Kovács Barbershop.
-Nyitvatartás: Hétfőtől szombatig 9:00-18:00.
-Szolgáltatások és árak:
-- Hajvágás: 3000 Ft
-- Szakállvágás: 2000 Ft
-- Hajvágás + szakáll: 4500 Ft
-Ha az ügyfél időpontot szeretne foglalni, kérdezd meg a nevét, mikor szeretne jönni, és milyen szolgáltatást kér.
-Mindig magyarul beszélj. Légy barátságos. Maximum 2-3 mondat.`;
+const SYSTEM_PROMPT = `Te egy magyar nyelvű AI asszisztens vagy egy fodrászat számára. A fodrászat neve: Kovács Barbershop. Nyitvatartás: Hétfőtől szombatig 9:00-18:00. Szolgáltatások: Hajvágás 3000 Ft, Szakállvágás 2000 Ft, Hajvágás+szakáll 4500 Ft. Mindig magyarul beszélj. Légy barátságos. Maximum 2-3 mondat.`;
 
 const groq = new OpenAI({
   apiKey: GROQ_API_KEY,
@@ -38,8 +30,7 @@ const deepgramClient = createClient(DEEPGRAM_API_KEY);
 app.post("/incoming", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
-  const stream = connect.stream({ url: `wss://${req.headers.host}/stream` });
-  stream.parameter({ name: "callSid", value: req.body.CallSid });
+  connect.stream({ url: `wss://${req.headers.host}/stream` });
   res.type("text/xml");
   res.send(twiml.toString());
 });
@@ -52,19 +43,17 @@ wss.on("connection", (ws) => {
   let conversationHistory = [{ role: "system", content: SYSTEM_PROMPT }];
   let isProcessing = false;
 
-  const deepgramConnection = deepgramClient.listen.live({
-    model: "nova-2",
+  const dgLive = deepgramClient.listen.live({
     language: "hu",
     smart_format: true,
     encoding: "mulaw",
     sample_rate: 8000,
-    channels: 1,
-    interim_results: false,
+    model: "nova-2",
   });
 
-  deepgramConnection.on(LiveTranscriptionEvents.Open, () => console.log("Deepgram OK"));
+  dgLive.on("open", () => console.log("Deepgram OK"));
 
-  deepgramConnection.on(LiveTranscriptionEvents.Transcript, async (data) => {
+  dgLive.on("Results", async (data) => {
     const transcript = data.channel?.alternatives?.[0]?.transcript;
     if (!transcript || transcript.trim() === "" || isProcessing) return;
     if (data.is_final && transcript.trim().length > 2) {
@@ -75,7 +64,7 @@ wss.on("connection", (ws) => {
     }
   });
 
-  deepgramConnection.on(LiveTranscriptionEvents.Error, (err) => console.error("Deepgram hiba:", err));
+  dgLive.on("error", (err) => console.error("Deepgram hiba:", err));
 
   ws.on("message", async (message) => {
     try {
@@ -85,16 +74,16 @@ wss.on("connection", (ws) => {
         await sendTTSResponse("Jo napot! Kovacs Barbershop, miben segithetem?");
       }
       if (data.event === "media") {
-        const audioChunk = Buffer.from(data.media.payload, "base64");
-        if (deepgramConnection.getReadyState() === 1) deepgramConnection.send(audioChunk);
+        const chunk = Buffer.from(data.media.payload, "base64");
+        if (dgLive.getReadyState() === 1) dgLive.send(chunk);
       }
-      if (data.event === "stop") deepgramConnection.finish();
+      if (data.event === "stop") dgLive.requestClose();
     } catch (err) {
       console.error("WS hiba:", err);
     }
   });
 
-  ws.on("close", () => { try { deepgramConnection.finish(); } catch (e) {} });
+  ws.on("close", () => { try { dgLive.requestClose(); } catch (e) {} });
 
   async function processUserInput(userText) {
     try {
@@ -103,12 +92,11 @@ wss.on("connection", (ws) => {
         model: "llama-3.3-70b-versatile",
         messages: conversationHistory,
         max_tokens: 150,
-        temperature: 0.7,
       });
-      const assistantResponse = completion.choices[0].message.content;
-      conversationHistory.push({ role: "assistant", content: assistantResponse });
-      console.log("Bot:", assistantResponse);
-      await sendTTSResponse(assistantResponse);
+      const response = completion.choices[0].message.content;
+      conversationHistory.push({ role: "assistant", content: response });
+      console.log("Bot:", response);
+      await sendTTSResponse(response);
     } catch (error) {
       console.error("Groq hiba:", error);
     }
@@ -116,23 +104,23 @@ wss.on("connection", (ws) => {
 
   async function sendTTSResponse(text) {
     try {
-      const response = await fetch(
+      const res = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=ulaw_8000`,
         {
           method: "POST",
           headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
           body: JSON.stringify({
-            text: text,
+            text,
             model_id: "eleven_turbo_v2_5",
-            voice_settings: { stability: 0.5, similarity_boost: 0.8, speed: 1.0 },
+            voice_settings: { stability: 0.5, similarity_boost: 0.8 },
           }),
         }
       );
-      if (!response.ok) { console.error("ElevenLabs hiba:", response.statusText); return; }
-      const audioBuffer = await response.arrayBuffer();
-      const base64Audio = Buffer.from(audioBuffer).toString("base64");
+      if (!res.ok) { console.error("ElevenLabs hiba:", res.statusText); return; }
+      const audio = await res.arrayBuffer();
+      const base64 = Buffer.from(audio).toString("base64");
       if (ws.readyState === WebSocket.OPEN && streamSid) {
-        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Audio } }));
+        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64 } }));
         ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "done" } }));
       }
     } catch (error) {
